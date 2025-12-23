@@ -218,6 +218,52 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
         if (!usdc.transfer(to, amount)) revert UsdcTransferFailed();
     }
 
+// ============================================================
+// View: current round status (readable on-chain)
+// ============================================================
+
+/**
+ * @notice Convenience getter for the current round status.
+ * @dev If there is no active round yet (currentRound == 0), all numeric values will be 0 and flags will be false.
+ */
+function getCurrentRoundStatus()
+    external
+    view
+    returns (
+        uint256 roundNumber,
+        uint256 entryFee,
+        uint256 prizeAmount,
+        uint256 prizeFunded,
+        bool isActive,
+        bool isPrizeFunded,
+        bool isCompleted,
+        address winner,
+        string memory winnerTeamName
+    )
+{
+    roundNumber = currentRound;
+    if (roundNumber == 0) {
+        // No round has been started yet
+        return (0, 0, 0, 0, false, false, false, address(0), "");
+    }
+
+    Round storage round = rounds[roundNumber];
+    entryFee = round.entryFee;
+    prizeAmount = round.prizeAmount;
+    prizeFunded = round.prizeFunded;
+
+    isCompleted = round.won;
+    isActive = !round.won;
+
+    // A round is "funded" once at least prizeAmount has been deposited for it.
+    isPrizeFunded = (prizeFunded >= prizeAmount);
+
+    winner = round.winner;
+    winnerTeamName = round.winnerTeamName;
+}
+
+
+
     // ============================================================
     // Player: commit–reveal
     // ============================================================
