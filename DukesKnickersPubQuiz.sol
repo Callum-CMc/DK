@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Base64.sol";
 
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -15,17 +14,15 @@ interface IERC20 {
 /**
  * Dukes Knickers Pub Quiz (Reusable Rounds) + Commit–Reveal + USDC entry/prize + ERC1155 NFTs
  *
+ * Size-optimized changes:
+ *  - Off-chain metadata: uri() returns base URIs (no Base64, no on-chain JSON building)
+ *  - Team name is NOT stored on-chain (only emitted in events). Reveal takes teamName as input.
+ *  - Team name validation reduced to length-only (prevents storage/grief without heavy bytecode).
+ *  - Removed OpenZeppelin Base64/Strings dependencies.
+ *
  * Token IDs:
- *  - LOST token is static and ALWAYS tokenId = 0 (on-chain metadata)
- *  - WINNER tokenId = roundId (starts at 1 and increases each round)
- *
- * Metadata:
- *  - LOST: on-chain JSON (data:application/json;utf8,...) with fixed image
- *  - WINNER: on-chain JSON (data:application/json;utf8,...) with dynamic Round + Team Name attributes
- *            and fixed image
- *
- * NOTE (Stack Too Deep Fix):
- *  - commit verification hashes answers with: keccak256(abi.encode(answers))
+ *  - LOST token is static and ALWAYS tokenId = 0
+ *  - WINNER tokenId == roundId (rounds start at 1)
  */
 contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
     // ---------------------------
@@ -52,13 +49,12 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
     error BadRoundId();
 
     error Banned();
-    // ---------------------------
-    // Revel delays
-    // ---------------------------
 
-    uint256 public constant MIN_REVEAL_DELAY = 6 seconds;
+    // ---------------------------
+    // Reveal delays
+    // ---------------------------
+    uint256 public constant MIN_REVEAL_DELAY = 5 seconds;
     uint256 public constant MAX_REVEAL_DELAY = 1 hours;
-
 
     // ---------------------------
     // Token IDs
@@ -67,15 +63,21 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
     uint256 public constant WINNER_BASE = 1;   // winner tokenId == roundId (rounds start at 1)
 
     // ---------------------------
-    // NFT image URIs
+    // Off-chain metadata base URIs
     // ---------------------------
-    // Winner token metadata uses this single image URI (owner can still change it).
-    string public constant winnerImageUri =
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/Trophy.svg/640px-Trophy.svg.png";
+    // Example:
+    //  - lostBaseUri   = "ipfs://.../lost/"   -> uri(0) => ipfs://.../lost/0.json
+    //  - winnerBaseUri = "ipfs://.../winner/" -> uri(roundId) => ipfs://.../winner/<roundId>.json
+    string public lostBaseUri;
+    string public winnerBaseUri;
 
-    // Lost token uses a fixed image URI and fully on-chain JSON metadata.
-    string public constant LOST_IMAGE_URI =
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/Andechser_Beer_-_Coaster_%28Germany%2C_2025%29.png/640px-Andechser_Beer_-_Coaster_%28Germany%2C_2025%29.png";
+    event UrisSet(string lostBaseUri, string winnerBaseUri);
+
+    function setBaseUris(string calldata lostBaseUri_, string calldata winnerBaseUri_) external onlyOwner {
+        lostBaseUri = lostBaseUri_;
+        winnerBaseUri = winnerBaseUri_;
+        emit UrisSet(lostBaseUri_, winnerBaseUri_);
+    }
 
     // ---------------------------
     // USDC
@@ -103,13 +105,11 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
 
         uint256 prizeFunded;
         bool won;
+        bool cancelled;
         address winner;
-        string winnerTeamName;
     }
 
-
-
-    uint256 public currentRound; // 0 means no active round yet
+    uint256 public currentRound; // 0 means no round yet
     mapping(uint256 => Round) public rounds;
 
     // ---------------------------
@@ -119,10 +119,13 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
         bytes32 commitHash;
         uint64 commitTime;
         bool revealed;
-        string teamName;
     }
 
     mapping(uint256 => mapping(address => CommitInfo)) public commits;
+
+    // Track players per round for owner cancellation (enables iteration)
+    mapping(uint256 => address[]) private _roundPlayers;
+    mapping(uint256 => mapping(address => bool)) private _isRoundPlayer;
 
     // ---------------------------
     // Events
@@ -135,15 +138,18 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
         uint256 maxRevealDelay
     );
 
+    event RoundCancelled(uint256 indexed roundId, uint256 playersAffected);
+
     event RoundAnswersUpdated(uint256 indexed roundId);
     event PrizeFunded(uint256 indexed roundId, address indexed from, uint256 amount);
     event PrizePaid(uint256 indexed roundId, address indexed to, uint256 amount);
 
+    // Team name is kept only in events (not stored).
+    event WinnerDeclared(uint256 indexed roundId, address indexed winner, string teamName);
     event Committed(uint256 indexed roundId, address indexed player, bytes32 indexed commitHash, string teamName);
-    event Revealed(uint256 indexed roundId, address indexed player, bool correct, uint256 tokenId, string teamName);
+    event Revealed(uint256 indexed roundId, address indexed player, bool correct, uint256 tokenId);
 
-    event BanSet(address indexed who, bool banned);
-    event WinnerImageUriSet(string newUri);
+    event BanSet(address indexed who, bool bannedStatus);
 
     // ---------------------------
     // Constructor
@@ -162,7 +168,6 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
         emit BanSet(who, isBanned);
     }
 
-
     // ============================================================
     // Owner: round lifecycle
     // ============================================================
@@ -173,7 +178,7 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
         bytes32 answerSalt_,
         bytes32[10] calldata correctAnswerHashes_
     ) external onlyOwner {
-                if (answerSalt_ == bytes32(0)) revert CommitMismatch();
+        if (answerSalt_ == bytes32(0)) revert CommitMismatch();
 
         currentRound += 1;
         uint256 r = currentRound;
@@ -185,10 +190,9 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
             correctAnswerHashes: correctAnswerHashes_,
             prizeFunded: 0,
             won: false,
-            winner: address(0),
-            winnerTeamName: ""
+            cancelled: false,
+            winner: address(0)
         });
-
 
         emit RoundStarted(r, entryFee_, prizeAmount_, MIN_REVEAL_DELAY, MAX_REVEAL_DELAY);
     }
@@ -200,8 +204,6 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
         rounds[r].correctAnswerHashes = newHashes;
         emit RoundAnswersUpdated(r);
     }
-
-
 
     function fundPrize(uint256 roundId, uint256 amount) external onlyOwner nonReentrant {
         if (roundId == 0 || roundId > currentRound) revert BadRoundId();
@@ -218,51 +220,40 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
         if (!usdc.transfer(to, amount)) revert UsdcTransferFailed();
     }
 
-// ============================================================
-// View: current round status (readable on-chain)
-// ============================================================
+    // ============================================================
+    // View: current round status
+    // ============================================================
 
-/**
- * @notice Convenience getter for the current round status.
- * @dev If there is no active round yet (currentRound == 0), all numeric values will be 0 and flags will be false.
- */
-function getCurrentRoundStatus()
-    external
-    view
-    returns (
-        uint256 roundNumber,
-        uint256 entryFee,
-        uint256 prizeAmount,
-        uint256 prizeFunded,
-        bool isActive,
-        bool isPrizeFunded,
-        bool isCompleted,
-        address winner,
-        string memory winnerTeamName
-    )
-{
-    roundNumber = currentRound;
-    if (roundNumber == 0) {
-        // No round has been started yet
-        return (0, 0, 0, 0, false, false, false, address(0), "");
+    function getCurrentRoundStatus()
+        external
+        view
+        returns (
+            uint256 roundNumber,
+            uint256 entryFee,
+            uint256 prizeAmount,
+            uint256 prizeFunded,
+            bool isActive,
+            bool isPrizeFunded,
+            bool isCompleted,
+            address winner
+        )
+    {
+        roundNumber = currentRound;
+        if (roundNumber == 0) {
+            return (0, 0, 0, 0, false, false, false, address(0));
+        }
+
+        Round storage round = rounds[roundNumber];
+        entryFee = round.entryFee;
+        prizeAmount = round.prizeAmount;
+        prizeFunded = round.prizeFunded;
+
+        isCompleted = round.won;
+        isActive = !round.won;
+        isPrizeFunded = (prizeFunded >= prizeAmount);
+
+        winner = round.winner;
     }
-
-    Round storage round = rounds[roundNumber];
-    entryFee = round.entryFee;
-    prizeAmount = round.prizeAmount;
-    prizeFunded = round.prizeFunded;
-
-    isCompleted = round.won;
-    isActive = !round.won;
-
-    // A round is "funded" once at least prizeAmount has been deposited for it.
-    isPrizeFunded = (prizeFunded >= prizeAmount);
-
-    winner = round.winner;
-    winnerTeamName = round.winnerTeamName;
-}
-
-
 
     // ============================================================
     // Player: commit–reveal
@@ -273,12 +264,15 @@ function getCurrentRoundStatus()
         if (r == 0) revert NoActiveRound();
         if (rounds[r].won) revert RoundAlreadyWon();
         if (commitHash == bytes32(0)) revert CommitMismatch();
-        if (!_isValidTeamName(teamName)) revert InvalidTeamName();
+
+        // length-only cap (size-optimized)
+        uint256 tnLen = bytes(teamName).length;
+        if (tnLen == 0 || tnLen > 32) revert InvalidTeamName();
 
         CommitInfo storage c = commits[r][msg.sender];
 
         if (c.commitHash != bytes32(0) && !c.revealed) {
-            if (!_isExpired(r, c.commitTime)) revert ActiveCommitExists();
+            if (!_isExpired(c.commitTime)) revert ActiveCommitExists();
         }
 
         uint256 fee = rounds[r].entryFee;
@@ -287,14 +281,78 @@ function getCurrentRoundStatus()
         commits[r][msg.sender] = CommitInfo({
             commitHash: commitHash,
             commitTime: uint64(block.timestamp),
-            revealed: false,
-            teamName: teamName
+            revealed: false
         });
+
+        // Track participants for owner-cancel (unique per round)
+        if (!_isRoundPlayer[r][msg.sender]) {
+            _isRoundPlayer[r][msg.sender] = true;
+            _roundPlayers[r].push(msg.sender);
+        }
 
         emit Committed(r, msg.sender, commitHash, teamName);
     }
 
-    function reveal(string[10] calldata answers, bytes32 userSalt) external nonReentrant notBanned {
+    function cancelCurrentRound() external onlyOwner nonReentrant {
+        uint256 r = currentRound;
+        if (r == 0) revert NoActiveRound();
+
+        Round storage round = rounds[r];
+        if (round.won) revert RoundAlreadyWon();
+
+        // Treat as completed round but with no winner
+        round.won = true;
+        round.cancelled = true;
+        round.winner = address(0);
+
+        address[] storage players = _roundPlayers[r];
+        uint256 affected;
+
+        for (uint256 i = 0; i < players.length; i++) {
+            address p = players[i];
+            CommitInfo storage c = commits[r][p];
+
+            // Mint LOST NFT to anyone who committed and hasn't already resolved their commit
+            if (c.commitHash != bytes32(0) && !c.revealed) {
+                c.revealed = true; // prevent later reveal
+                _mint(p, LOST_TOKEN_ID, 1, "");
+                affected++;
+            }
+        }
+
+        emit RoundCancelled(r, affected);
+    }
+
+    function roundPlayers(
+        uint256 roundId,
+        uint256 start,
+        uint256 count
+    ) external view returns (address[] memory players) {
+        address[] storage all = _roundPlayers[roundId];
+        uint256 total = all.length;
+
+        if (start >= total) {
+            return new address[](0);
+        }
+
+        uint256 end = start + count;
+        if (end > total) {
+            end = total;
+        }
+
+        uint256 size = end - start;
+        players = new address[](size);
+
+        for (uint256 i = 0; i < size; i++) {
+            players[i] = all[start + i];
+        }
+    }
+
+    function reveal(string[10] calldata answers, bytes32 userSalt, string calldata teamName)
+        external
+        nonReentrant
+        notBanned
+    {
         uint256 r = currentRound;
         if (r == 0) revert NoActiveRound();
 
@@ -304,13 +362,11 @@ function getCurrentRoundStatus()
         CommitInfo storage c = commits[r][msg.sender];
         if (c.commitHash == bytes32(0)) revert NoCommit();
         if (c.revealed) revert AlreadyRevealed();
-        if (_isExpired(r, c.commitTime)) revert CommitExpired();
+        if (_isExpired(c.commitTime)) revert CommitExpired();
         if (block.timestamp < uint256(c.commitTime) + MIN_REVEAL_DELAY) revert TooEarlyToReveal();
 
-        // Commit verification:
-        // teamHash = keccak256(teamName)
-        // answersHash = keccak256(abi.encode(answers))  <-- stack-safe fix
-        bytes32 teamHash = keccak256(bytes(c.teamName));
+        // Verify commit (team name provided at reveal; not stored)
+        bytes32 teamHash = keccak256(bytes(teamName));
         bytes32 answersHash = keccak256(abi.encode(answers));
         bytes32 recomputed = keccak256(abi.encodePacked(msg.sender, teamHash, answersHash, userSalt));
         if (recomputed != c.commitHash) revert CommitMismatch();
@@ -324,21 +380,19 @@ function getCurrentRoundStatus()
 
             round.won = true;
             round.winner = msg.sender;
-            round.winnerTeamName = c.teamName;
+
+            emit WinnerDeclared(r, msg.sender, teamName);
 
             round.prizeFunded -= round.prizeAmount;
-
             if (!usdc.transfer(msg.sender, round.prizeAmount)) revert UsdcTransferFailed();
             emit PrizePaid(r, msg.sender, round.prizeAmount);
 
-            // Winner tokenId starts at 1 and increases every round => tokenId == roundId
-            uint256 winnerTokenId = r; // (equivalently: WINNER_BASE + (r - 1))
+            uint256 winnerTokenId = r;
             _mint(msg.sender, winnerTokenId, 1, "");
-            emit Revealed(r, msg.sender, true, winnerTokenId, c.teamName);
+            emit Revealed(r, msg.sender, true, winnerTokenId);
         } else {
-            // Lost token is static tokenId=0
             _mint(msg.sender, LOST_TOKEN_ID, 1, "");
-            emit Revealed(r, msg.sender, false, LOST_TOKEN_ID, c.teamName);
+            emit Revealed(r, msg.sender, false, LOST_TOKEN_ID);
         }
     }
 
@@ -348,20 +402,14 @@ function getCurrentRoundStatus()
         CommitInfo storage c = commits[roundId][player];
         if (c.commitHash == bytes32(0)) revert NoCommit();
         if (c.revealed) revert AlreadyRevealed();
-        if (!_isExpired(roundId, c.commitTime)) revert CommitExpired(); // reused: means "not expired yet"
+        if (!_isExpired(c.commitTime)) revert CommitExpired(); // reused: means "not expired yet"
 
         delete commits[roundId][player];
     }
 
-    function _isExpired(uint256 /* roundId */, uint64 commitTime)
-        internal
-        view
-        returns (bool)
-    {
+    function _isExpired(uint64 commitTime) internal view returns (bool) {
         return block.timestamp > uint256(commitTime) + MAX_REVEAL_DELAY;
     }
-
-
 
     // ============================================================
     // Answer checking
@@ -377,70 +425,25 @@ function getCurrentRoundStatus()
     }
 
     // ============================================================
-    // Metadata (ERC1155 uri)
+    // Metadata (ERC1155 uri) - OFF-CHAIN
     // ============================================================
-function uri(uint256 id) public view override returns (string memory) {
-    // ------------------------------------------------------------
-    // LOST token (tokenId = 0) — fully on-chain, Base64 encoded
-    // ------------------------------------------------------------
-    if (id == LOST_TOKEN_ID) {
-        bytes memory json = abi.encodePacked(
-            "{",
-                "\"name\":\"Lost Quiz Stolen Drinks Coaster\",",
-                "\"description\":\"Stolen from The Dukes Knickers Pub after losing the Pub Quiz.\",",
-                "\"image\":\"", LOST_IMAGE_URI, "\",",
-                "\"attributes\":[",
-                    "{\"trait_type\":\"Result\",\"value\":\"Lost\"}",
-                "]",
-            "}"
-        );
 
-        return string(
-            abi.encodePacked(
-                "data:application/json;base64,",
-                Base64.encode(json)
-            )
-        );
+    function uri(uint256 id) public view override returns (string memory) {
+        if (id == LOST_TOKEN_ID) {
+            return string.concat(lostBaseUri, "0.json");
+        }
+
+        if (id >= WINNER_BASE && id <= currentRound) {
+            Round storage round = rounds[id];
+            if (!round.won || round.cancelled) revert InvalidTokenId();
+            return string.concat(winnerBaseUri, _toString(id), ".json");
+        }
+
+        revert InvalidTokenId();
     }
 
-    // ------------------------------------------------------------
-    // WINNER tokens (tokenId == roundId, starting at 1)
-    // Only valid AFTER the round has been won
-    // ------------------------------------------------------------
-    if (id >= WINNER_BASE && id <= currentRound) {
-        Round storage round = rounds[id];
-
-        // Token metadata only exists once the winner is known
-        if (!round.won) revert InvalidTokenId();
-
-        bytes memory json = abi.encodePacked(
-            "{",
-                "\"name\":\"The Dukes Knickers Pub Quiz Winner - ", round.winnerTeamName, "\",",
-                "\"description\":\"Congratulations on winning The Dukes Knickers Pub Quiz.\",",
-                "\"image\":\"", winnerImageUri, "\",",
-                "\"attributes\":[",
-                    "{\"trait_type\":\"Result\",\"value\":\"Winner\"},",
-                    "{\"trait_type\":\"Round\",\"value\":\"", _toString(id), "\"},",
-                    "{\"trait_type\":\"Team Name\",\"value\":\"", round.winnerTeamName, "\"}",
-                "]",
-            "}"
-        );
-
-        return string(
-            abi.encodePacked(
-                "data:application/json;base64,",
-                Base64.encode(json)
-            )
-        );
-    }
-
-    revert InvalidTokenId();
-}
-
-
-
     // ============================================================
-    // Tiny uint->string (avoid importing Strings)
+    // Tiny uint->string
     // ============================================================
 
     function _toString(uint256 x) internal pure returns (string memory) {
@@ -458,29 +461,5 @@ function uri(uint256 id) public view override returns (string memory) {
             x /= 10;
         }
         return string(buffer);
-    }
-
-    // ============================================================
-    // Team name validation
-    // ============================================================
-
-    function _isValidTeamName(string calldata s) internal pure returns (bool) {
-        bytes calldata b = bytes(s);
-        uint256 len = b.length;
-        if (len == 0 || len > 32) return false;
-
-        for (uint256 i = 0; i < len; i++) {
-            bytes1 c = b[i];
-            bool ok =
-                (c >= 0x30 && c <= 0x39) || // 0-9
-                (c >= 0x41 && c <= 0x5A) || // A-Z
-                (c >= 0x61 && c <= 0x7A) || // a-z
-                (c == 0x20) ||              // space
-                (c == 0x5F) ||              // _
-                (c == 0x2E) ||              // .
-                (c == 0x2D);                // -
-            if (!ok) return false;
-        }
-        return true;
     }
 }
