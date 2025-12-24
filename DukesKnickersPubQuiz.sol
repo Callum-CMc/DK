@@ -14,15 +14,15 @@ interface IERC20 {
 /**
  * Dukes Knickers Pub Quiz (Reusable Rounds) + Commit–Reveal + USDC entry/prize + ERC1155 NFTs
  *
- * Size-optimized changes:
- *  - Off-chain metadata: uri() returns base URIs (no Base64, no on-chain JSON building)
+ * Size-optimized + STATIC Winner token metadata:
+ *  - Off-chain metadata: uri() returns static URIs (no Base64, no on-chain JSON building)
  *  - Team name is NOT stored on-chain (only emitted in events). Reveal takes teamName as input.
- *  - Team name validation reduced to length-only (prevents storage/grief without heavy bytecode).
- *  - Removed OpenZeppelin Base64/Strings dependencies.
+ *  - Team name validation reduced to length-only (prevents grief without heavy bytecode).
+ *  - Winner token ID is STATIC (WINNER_TOKEN_ID = 1) regardless of round.
  *
  * Token IDs:
- *  - LOST token is static and ALWAYS tokenId = 0
- *  - WINNER tokenId == roundId (rounds start at 1)
+ *  - LOST token is static tokenId = 0
+ *  - WINNER token is static tokenId = 1
  */
 contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
     // ---------------------------
@@ -59,24 +59,21 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
     // ---------------------------
     // Token IDs
     // ---------------------------
-    uint256 public constant LOST_TOKEN_ID = 0; // static loser/participant NFT
-    uint256 public constant WINNER_BASE = 1;   // winner tokenId == roundId (rounds start at 1)
+    uint256 public constant LOST_TOKEN_ID = 0;   // static loser/participant NFT
+    uint256 public constant WINNER_TOKEN_ID = 1; // static winner NFT
 
     // ---------------------------
-    // Off-chain metadata base URIs
+    // Off-chain metadata URIs (STATIC)
     // ---------------------------
-    // Example:
-    //  - lostBaseUri   = "ipfs://.../lost/"   -> uri(0) => ipfs://.../lost/0.json
-    //  - winnerBaseUri = "ipfs://.../winner/" -> uri(roundId) => ipfs://.../winner/<roundId>.json
-    string public lostBaseUri;
-    string public winnerBaseUri;
+    string public lostUri;   // uri(0)
+    string public winnerUri; // uri(1)
 
-    event UrisSet(string lostBaseUri, string winnerBaseUri);
+    event UrisSet(string lostUri, string winnerUri);
 
-    function setBaseUris(string calldata lostBaseUri_, string calldata winnerBaseUri_) external onlyOwner {
-        lostBaseUri = lostBaseUri_;
-        winnerBaseUri = winnerBaseUri_;
-        emit UrisSet(lostBaseUri_, winnerBaseUri_);
+    function setUris(string calldata lostUri_, string calldata winnerUri_) external onlyOwner {
+        lostUri = lostUri_;
+        winnerUri = winnerUri_;
+        emit UrisSet(lostUri_, winnerUri_);
     }
 
     // ---------------------------
@@ -387,9 +384,8 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
             if (!usdc.transfer(msg.sender, round.prizeAmount)) revert UsdcTransferFailed();
             emit PrizePaid(r, msg.sender, round.prizeAmount);
 
-            uint256 winnerTokenId = r;
-            _mint(msg.sender, winnerTokenId, 1, "");
-            emit Revealed(r, msg.sender, true, winnerTokenId);
+            _mint(msg.sender, WINNER_TOKEN_ID, 1, "");
+            emit Revealed(r, msg.sender, true, WINNER_TOKEN_ID);
         } else {
             _mint(msg.sender, LOST_TOKEN_ID, 1, "");
             emit Revealed(r, msg.sender, false, LOST_TOKEN_ID);
@@ -425,41 +421,12 @@ contract DukesKnickersQuiz is ERC1155, Ownable, ReentrancyGuard {
     }
 
     // ============================================================
-    // Metadata (ERC1155 uri) - OFF-CHAIN
+    // Metadata (ERC1155 uri) - STATIC OFF-CHAIN
     // ============================================================
 
     function uri(uint256 id) public view override returns (string memory) {
-        if (id == LOST_TOKEN_ID) {
-            return string.concat(lostBaseUri, "0.json");
-        }
-
-        if (id >= WINNER_BASE && id <= currentRound) {
-            Round storage round = rounds[id];
-            if (!round.won || round.cancelled) revert InvalidTokenId();
-            return string.concat(winnerBaseUri, _toString(id), ".json");
-        }
-
+        if (id == LOST_TOKEN_ID) return lostUri;
+        if (id == WINNER_TOKEN_ID) return winnerUri;
         revert InvalidTokenId();
-    }
-
-    // ============================================================
-    // Tiny uint->string
-    // ============================================================
-
-    function _toString(uint256 x) internal pure returns (string memory) {
-        if (x == 0) return "0";
-        uint256 temp = x;
-        uint256 digits;
-        while (temp != 0) {
-            digits++;
-            temp /= 10;
-        }
-        bytes memory buffer = new bytes(digits);
-        while (x != 0) {
-            digits -= 1;
-            buffer[digits] = bytes1(uint8(48 + uint256(x % 10)));
-            x /= 10;
-        }
-        return string(buffer);
     }
 }
